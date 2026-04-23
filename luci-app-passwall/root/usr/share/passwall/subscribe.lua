@@ -507,6 +507,87 @@ local function convert_xray_profile_to_vless(profile)
 	return nil
 end
 
+local function shell_quote(s)
+	return "'" .. tostring(s or ""):gsub("'", "'\\''") .. "'"
+end
+
+-- 通过 test.sh 获取节点探测耗时（秒），仅接受 200 响应结果
+local function get_node_probe_time(node_id)
+	if not node_id or node_id == "" then
+		return nil
+	end
+	local cmd = "/usr/share/passwall/test.sh url_test_node " .. shell_quote(node_id) .. " 2>/dev/null"
+	local out = api.trim(luci.sys.exec(cmd) or "")
+	local code, sec = out:match("^(%d+):([%d%.]+)$")
+	if tonumber(code) == 200 then
+		return tonumber(sec)
+	end
+	return nil
+end
+
+-- 订阅更新后自动选择测速最快节点写入全局 TCP/UDP 节点
+local function auto_select_fastest_node(updated_group_set)
+	if not updated_group_set or next(updated_group_set) == nil then
+		return
+	end
+	local enabled = uci:get(appname, "@global_subscribe[0]", "auto_select_fastest") or "1"
+	if enabled ~= "1" then
+		return
+	end
+	local max_test = tonumber(uci:get(appname, "@global_subscribe[0]", "auto_select_fastest_max")) or 8
+	if max_test < 1 then max_test = 1 end
+	if max_test > 20 then max_test = 20 end
+	local threshold_ms = tonumber(uci:get(appname, "@global_subscribe[0]", "auto_select_fastest_threshold_ms")) or 20
+	local threshold_sec = threshold_ms / 1000
+
+	local candidates = {}
+	uci:foreach(appname, "nodes", function(node)
+		if node and node[".name"] and node.add_mode == "2" and node.group and updated_group_set[node.group:lower()] == true then
+			if node.protocol ~= "_shunt" and node.protocol ~= "_balancing" and node.protocol ~= "_iface" and node.protocol ~= "_urltest" then
+				candidates[#candidates + 1] = node[".name"]
+			end
+		end
+	end)
+	if #candidates == 0 then
+		log("自动选速: 没有可测速候选节点。")
+		return
+	end
+
+	local best_id, best_t
+	local tested = 0
+	for _, id in ipairs(candidates) do
+		if tested >= max_test then
+			break
+		end
+		local t = get_node_probe_time(id)
+		tested = tested + 1
+		if t then
+			if (not best_t) or t < best_t then
+				best_t = t
+				best_id = id
+			end
+		end
+	end
+	if not best_id then
+		log("自动选速: 候选节点测速失败，保持原节点。")
+		return
+	end
+
+	local current = uci:get(appname, "@global[0]", "tcp_node") or ""
+	if current ~= "" and current ~= best_id then
+		local current_t = get_node_probe_time(current)
+		if current_t and best_t and (best_t >= current_t - threshold_sec) then
+			log(string.format("自动选速: 当前节点更稳或差距不足(%dms)，保持不切换。", threshold_ms))
+			return
+		end
+	end
+
+	uci:set(appname, "@global[0]", "tcp_node", best_id)
+	uci:set(appname, "@global[0]", "udp_node", best_id)
+	api.uci_save(uci, appname, true)
+	log(string.format("自动选速: 已切换最快节点 -> %s (%.3fs)", best_id, best_t or 0))
+end
+
 -- 取机场信息（剩余流量、到期时间）
 local subscribe_info = {}
 local function get_subscribe_info(cfgid, value)
@@ -1952,6 +2033,11 @@ local function update_node(manual)
 		end
 
 		api.uci_save(uci, appname, true)
+	end
+
+	-- 仅在订阅更新后尝试自动选速
+	if manual == 0 then
+		auto_select_fastest_node(group)
 	end
 
 	if arg[3] == "cron" then
